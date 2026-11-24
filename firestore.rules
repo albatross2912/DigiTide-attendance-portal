@@ -1,0 +1,156 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userRole() {
+      return get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data.role;
+    }
+
+    function isLeadOrAdmin() {
+      return signedIn() && userRole() in ['lead', 'admin'];
+    }
+
+    function validBreakType(type) {
+      return type in ['Tea', 'Lunch', 'Short', 'Meeting'];
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isLeadOrAdmin();
+
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly(['displayName', 'updatedAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 60
+        && request.resource.data.updatedAt == request.time;
+
+      allow create, delete: if false;
+    }
+
+    match /activeShifts/{uid} {
+      allow read: if isOwner(uid) || isLeadOrAdmin();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'working'
+        && request.resource.data.loginTime == request.time
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.currentBreak == null
+        && request.resource.data.totalBreakSeconds == 0
+        && existsAfter(
+          /databases/$(database)/documents/shifts/$(request.resource.data.shiftId)
+        );
+
+      allow update: if isOwner(uid)
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.shiftId == resource.data.shiftId
+        && request.resource.data.loginTime == resource.data.loginTime
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly([
+            'currentBreak',
+            'status',
+            'totalBreakSeconds',
+            'lastBreak',
+            'updatedAt'
+          ])
+        && (
+          (
+            resource.data.status == 'working'
+            && resource.data.currentBreak == null
+            && request.resource.data.status == 'break'
+            && request.resource.data.currentBreak is map
+            && validBreakType(request.resource.data.currentBreak.type)
+            && request.resource.data.currentBreak.startTime is timestamp
+            && request.resource.data.currentBreak.startTime <= request.time
+            && request.resource.data.totalBreakSeconds == resource.data.totalBreakSeconds
+          )
+          ||
+          (
+            resource.data.status == 'break'
+            && resource.data.currentBreak is map
+            && request.resource.data.status == 'working'
+            && request.resource.data.currentBreak == null
+            && request.resource.data.lastBreak is map
+            && request.resource.data.lastBreak.type == resource.data.currentBreak.type
+            && request.resource.data.lastBreak.startTime == resource.data.currentBreak.startTime
+            && request.resource.data.lastBreak.endTime is timestamp
+            && request.resource.data.lastBreak.endTime <= request.time
+            && request.resource.data.totalBreakSeconds >= resource.data.totalBreakSeconds
+          )
+        )
+        && (
+          !('updatedAt' in request.resource.data)
+          || request.resource.data.updatedAt == request.time
+        );
+
+      allow delete: if isOwner(uid)
+        && getAfter(
+          /databases/$(database)/documents/shifts/$(resource.data.shiftId)
+        ).data.status == 'completed';
+    }
+
+    match /shifts/{shiftId} {
+      allow read: if signedIn()
+        && (
+          resource.data.userId == request.auth.uid
+          || isLeadOrAdmin()
+        );
+
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.shiftId == shiftId
+        && request.resource.data.status == 'working'
+        && request.resource.data.loginTime == request.time
+        && request.resource.data.createdAt == request.time
+        && existsAfter(
+          /databases/$(database)/documents/activeShifts/$(request.auth.uid)
+        );
+
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && resource.data.status == 'working'
+        && request.resource.data.status == 'completed'
+        && request.resource.data.logoutTime is timestamp
+        && request.resource.data.logoutTime <= request.time
+        && request.resource.data.currentBreak == null
+        && request.resource.data.totalSeconds is number
+        && request.resource.data.totalBreakSeconds is number
+        && request.resource.data.workSeconds is number
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly([
+            'logoutTime',
+            'totalSeconds',
+            'totalBreakSeconds',
+            'workSeconds',
+            'currentBreak',
+            'status',
+            'updatedAt'
+          ])
+        && (
+          !('updatedAt' in request.resource.data)
+          || request.resource.data.updatedAt == request.time
+        )
+        && !existsAfter(
+          /databases/$(database)/documents/activeShifts/$(request.auth.uid)
+        );
+
+      allow delete: if false;
+    }
+  }
+}

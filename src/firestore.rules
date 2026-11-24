@@ -1,0 +1,258 @@
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userRole() {
+      return get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data.role;
+    }
+
+    function isLeadOrAdmin() {
+      return signedIn() &&
+        userRole() in ['lead', 'admin'];
+    }
+
+    function canViewTeam() {
+      return isLeadOrAdmin();
+    }
+
+    function validBreakType(type) {
+      return type in ['Tea', 'Lunch', 'Short', 'Meeting'];
+    }
+
+    // Employee profiles
+    match /users/{uid} {
+
+      allow read: if isOwner(uid) || canViewTeam();
+
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly(['displayName', 'updatedAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 60
+        && request.resource.data.updatedAt == request.time;
+
+      allow create, delete: if false;
+    }
+
+    // Active attendance sessions
+    match /activeShifts/{uid} {
+
+      allow read: if isOwner(uid) || canViewTeam();
+
+      // Start a shift
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasAll([
+          'shiftId',
+          'userId',
+          'displayName',
+          'email',
+          'role',
+          'loginTime',
+          'currentBreak',
+          'totalBreakSeconds',
+          'status',
+          'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'shiftId',
+          'userId',
+          'displayName',
+          'email',
+          'role',
+          'loginTime',
+          'currentBreak',
+          'totalBreakSeconds',
+          'status',
+          'createdAt'
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.role ==
+          get(
+            /databases/$(database)/documents/users/$(uid)
+          ).data.role
+        && request.resource.data.status == 'working'
+        && request.resource.data.loginTime == request.time
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.currentBreak == null
+        && request.resource.data.totalBreakSeconds == 0
+        && existsAfter(
+          /databases/$(database)/documents/shifts/$(request.resource.data.shiftId)
+        );
+
+      // Start or end a break
+      allow update: if isOwner(uid)
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.shiftId == resource.data.shiftId
+        && request.resource.data.loginTime == resource.data.loginTime
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly([
+            'currentBreak',
+            'status',
+            'totalBreakSeconds',
+            'lastBreak',
+            'updatedAt'
+          ])
+        && request.resource.data.updatedAt == request.time
+        && (
+          // Start break
+          (
+            resource.data.status == 'working'
+            && resource.data.currentBreak == null
+            && request.resource.data.status == 'break'
+            && request.resource.data.currentBreak is map
+            && request.resource.data.currentBreak.keys()
+              .hasOnly(['type', 'startTime'])
+            && validBreakType(
+              request.resource.data.currentBreak.type
+            )
+            && request.resource.data.currentBreak.startTime ==
+              request.time
+            && request.resource.data.totalBreakSeconds ==
+              resource.data.totalBreakSeconds
+          )
+
+          ||
+
+          // End break
+          (
+            resource.data.status == 'break'
+            && resource.data.currentBreak is map
+            && request.resource.data.status == 'working'
+            && request.resource.data.currentBreak == null
+            && request.resource.data.lastBreak is map
+            && request.resource.data.lastBreak.keys()
+              .hasOnly([
+                'type',
+                'startTime',
+                'endTime',
+                'durationSeconds'
+              ])
+            && request.resource.data.lastBreak.type ==
+              resource.data.currentBreak.type
+            && request.resource.data.lastBreak.startTime ==
+              resource.data.currentBreak.startTime
+            && request.resource.data.lastBreak.endTime ==
+              request.time
+            && request.resource.data.lastBreak.durationSeconds is number
+            && request.resource.data.lastBreak.durationSeconds >= 0
+            && request.resource.data.totalBreakSeconds is number
+            && request.resource.data.totalBreakSeconds >=
+              resource.data.totalBreakSeconds
+          )
+        );
+
+      // Delete active session only when its shift is completed
+      allow delete: if isOwner(uid)
+        && getAfter(
+          /databases/$(database)/documents/shifts/$(resource.data.shiftId)
+        ).data.status == 'completed';
+    }
+
+    // Attendance history
+    match /shifts/{shiftId} {
+
+      allow read: if signedIn()
+        && (
+          resource.data.userId == request.auth.uid
+          || canViewTeam()
+        );
+
+      // Create shift history with a new active session
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll([
+          'shiftId',
+          'userId',
+          'displayName',
+          'email',
+          'role',
+          'loginTime',
+          'currentBreak',
+          'totalBreakSeconds',
+          'status',
+          'createdAt',
+          'logoutTime',
+          'totalSeconds',
+          'workSeconds'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'shiftId',
+          'userId',
+          'displayName',
+          'email',
+          'role',
+          'loginTime',
+          'currentBreak',
+          'totalBreakSeconds',
+          'status',
+          'createdAt',
+          'logoutTime',
+          'totalSeconds',
+          'workSeconds'
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.shiftId == shiftId
+        && request.resource.data.role ==
+          get(
+            /databases/$(database)/documents/users/$(request.auth.uid)
+          ).data.role
+        && request.resource.data.status == 'working'
+        && request.resource.data.loginTime == request.time
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.currentBreak == null
+        && request.resource.data.totalBreakSeconds == 0
+        && request.resource.data.logoutTime == null
+        && request.resource.data.totalSeconds == 0
+        && request.resource.data.workSeconds == 0
+        && existsAfter(
+          /databases/$(database)/documents/activeShifts/$(request.auth.uid)
+        );
+
+      // Complete a shift
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && resource.data.status == 'working'
+        && request.resource.data.status == 'completed'
+        && request.resource.data.logoutTime == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.currentBreak == null
+        && request.resource.data.totalSeconds is number
+        && request.resource.data.totalSeconds >= 0
+        && request.resource.data.totalBreakSeconds is number
+        && request.resource.data.totalBreakSeconds >= 0
+        && request.resource.data.workSeconds is number
+        && request.resource.data.workSeconds >= 0
+        && request.resource.data.diff(resource.data)
+          .affectedKeys()
+          .hasOnly([
+            'logoutTime',
+            'totalSeconds',
+            'totalBreakSeconds',
+            'workSeconds',
+            'currentBreak',
+            'status',
+            'updatedAt'
+          ])
+        && !existsAfter(
+          /databases/$(database)/documents/activeShifts/$(request.auth.uid)
+        );
+
+      allow delete: if false;
+    }
+  }
+}
